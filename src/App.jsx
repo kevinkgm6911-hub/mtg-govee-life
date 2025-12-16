@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import "./App.css";
 
 const DEFAULT_PLAYERS = [
@@ -18,9 +18,20 @@ const EFFECTS = [
   { id: "COUNTER_WAR", title: "Counter War", desc: "rapid flicker" },
 ];
 
+const DEFAULT_BASELINE = {
+  turn: "on",
+  brightness: 80,
+  // Choose ONE: either color OR colorTem
+  color: { r: 255, g: 255, b: 255 },
+  // colorTem: 4500,
+};
+
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
 export default function App() {
   const [players, setPlayers] = useState(DEFAULT_PLAYERS);
-
   const [effectsOpen, setEffectsOpen] = useState(false);
 
   // Govee
@@ -29,33 +40,41 @@ export default function App() {
   const [deviceId, setDeviceId] = useState("1F:2C:D4:0F:44:46:4F:2C");
   const [model, setModel] = useState("H6099");
 
+  // Baseline (what the room light should return to after effects)
+  const [baseline, setBaseline] = useState(() => {
+    try {
+      return JSON.parse(localStorage.getItem("goveeBaseline") || "null");
+    } catch {
+      return null;
+    }
+  });
+
+  // Rate-limit + queue to avoid 429
+  const effectLock = useRef(false);
+  const cmdQueue = useRef(Promise.resolve());
+  const lastCmdAt = useRef(0);
+
   const selectedLabel = useMemo(() => {
     const d = devices.find((x) => x.device === deviceId);
-    return d ? `${d.deviceName} (${d.model})` : `${model} • ${deviceId.slice(0, 6)}…`;
+    return d ? `${d.deviceName} (${d.model})` : `${model} • ${deviceId?.slice(0, 6) ?? ""}…`;
   }, [devices, deviceId, model]);
 
-  // Throttle effect triggers to avoid spamming cloud API
-  const [lastEffectAt, setLastEffectAt] = useState(0);
-
   useEffect(() => {
-    // load device list from your Netlify function
     (async () => {
       try {
         const resp = await fetch("/.netlify/functions/govee-devices");
         const json = await resp.json();
         const list = json?.data?.devices || [];
-        console.log("GOVEE DEVICES:", list);
         setDevices(list);
+        console.log("GOVEE DEVICES:", list);
 
-        // If user hasn’t chosen yet, auto-pick the first controllable one
         if ((!deviceId || !model) && list.length > 0) {
           const first = list[0];
           setDeviceId(first.device);
           setModel(first.model);
         }
       } catch (e) {
-        // no-op: user can still manually set device/model later
-        console.error(e);
+        console.error("Failed to load govee devices:", e);
       }
     })();
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -67,109 +86,158 @@ export default function App() {
     );
   }
 
-async function goveeControl(cmd) {
-  if (!goveeEnabled) return;
-  if (!deviceId || !model) return;
-
-  const resp = await fetch("/.netlify/functions/govee-control", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ device: deviceId, model, cmd }),
-  });
-
-  // Don't assume JSON; govee-control may return an empty body on success.
-  const text = await resp.text();
-  let data = null;
-  try {
-    data = text ? JSON.parse(text) : null;
-  } catch {
-    data = { raw: text };
+  function saveBaseline(next) {
+    setBaseline(next);
+    localStorage.setItem("goveeBaseline", JSON.stringify(next));
   }
 
-  if (!resp.ok) {
-    console.error("Govee control failed:", resp.status, data);
+  async function goveeControl(cmd) {
+    if (!goveeEnabled) return;
+    if (!deviceId || !model) return;
+
+    const resp = await fetch("/.netlify/functions/govee-control", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ device: deviceId, model, cmd }),
+    });
+
+    // Do not assume JSON (some responses can be empty)
+    const text = await resp.text();
+    let data = null;
+    try {
+      data = text ? JSON.parse(text) : null;
+    } catch {
+      data = { raw: text };
+    }
+
+    if (!resp.ok) {
+      console.error("Govee control failed:", resp.status, data);
+    }
+
+    return data;
   }
 
-  return data;
-}
+  async function goveeControlThrottled(cmd) {
+    // Serialize commands + add a minimum gap to prevent 429
+    cmdQueue.current = cmdQueue.current.then(async () => {
+      const minGapMs = 650; // increase if you still see 429
+      const now = Date.now();
+      const wait = Math.max(0, minGapMs - (now - lastCmdAt.current));
+      if (wait) await sleep(wait);
 
-  function sleep(ms) {
-    return new Promise((r) => setTimeout(r, ms));
+      lastCmdAt.current = Date.now();
+      return goveeControl(cmd);
+    });
+
+    return cmdQueue.current;
+  }
+
+  async function restoreBaseline() {
+    if (!baseline) return;
+
+    // Safe order: turn -> color/colortem -> brightness
+    if (baseline.turn) {
+      await goveeControlThrottled({ name: "turn", value: baseline.turn });
+    }
+
+    if (baseline.color) {
+      await goveeControlThrottled({ name: "color", value: baseline.color });
+    } else if (typeof baseline.colorTem === "number") {
+      await goveeControlThrottled({ name: "colorTem", value: baseline.colorTem });
+    }
+
+    if (typeof baseline.brightness === "number") {
+      await goveeControlThrottled({ name: "brightness", value: baseline.brightness });
+    }
   }
 
   async function triggerEffect(effectId) {
-    const now = Date.now();
-    if (now - lastEffectAt < 800) return;
-    setLastEffectAt(now);
+    if (!goveeEnabled) return;
+    if (!deviceId || !model) return;
 
-    // Simple sequences. Your device supports: turn, brightness, color, colorTem.
-    switch (effectId) {
-      case "DMG_SMALL":
-        await goveeControl({ name: "brightness", value: 25 });
-        await sleep(160);
-        await goveeControl({ name: "brightness", value: 100 });
-        break;
+    // Ignore spam while an effect is running
+    if (effectLock.current) return;
+    effectLock.current = true;
 
-      case "DMG_MED":
-        await goveeControl({ name: "brightness", value: 15 });
-        await sleep(140);
-        await goveeControl({ name: "brightness", value: 100 });
-        await sleep(140);
-        await goveeControl({ name: "brightness", value: 35 });
-        await sleep(140);
-        await goveeControl({ name: "brightness", value: 100 });
-        break;
+    try {
+      switch (effectId) {
+        case "DMG_SMALL":
+          await goveeControlThrottled({ name: "brightness", value: 25 });
+          await sleep(160);
+          await goveeControlThrottled({ name: "brightness", value: 100 });
+          break;
 
-      case "DMG_BIG":
-        await goveeControl({ name: "turn", value: "on" });
-        await goveeControl({ name: "color", value: { r: 255, g: 30, b: 30 } });
-        await goveeControl({ name: "brightness", value: 100 });
-        await sleep(120);
-        await goveeControl({ name: "brightness", value: 10 });
-        await sleep(160);
-        await goveeControl({ name: "brightness", value: 100 });
-        break;
+        case "DMG_MED":
+          await goveeControlThrottled({ name: "brightness", value: 15 });
+          await sleep(140);
+          await goveeControlThrottled({ name: "brightness", value: 100 });
+          await sleep(140);
+          await goveeControlThrottled({ name: "brightness", value: 35 });
+          await sleep(140);
+          await goveeControlThrottled({ name: "brightness", value: 100 });
+          break;
 
-      case "GAIN_LIFE":
-        await goveeControl({ name: "color", value: { r: 60, g: 255, b: 140 } });
-        await goveeControl({ name: "brightness", value: 25 });
-        await sleep(140);
-        await goveeControl({ name: "brightness", value: 90 });
-        break;
+        case "DMG_BIG":
+          await goveeControlThrottled({ name: "turn", value: "on" });
+          await goveeControlThrottled({ name: "color", value: { r: 255, g: 30, b: 30 } });
+          await goveeControlThrottled({ name: "brightness", value: 100 });
+          await sleep(120);
+          await goveeControlThrottled({ name: "brightness", value: 10 });
+          await sleep(160);
+          await goveeControlThrottled({ name: "brightness", value: 100 });
+          break;
 
-      case "BOARD_WIPE":
-        await goveeControl({ name: "color", value: { r: 255, g: 255, b: 255 } });
-        await goveeControl({ name: "brightness", value: 100 });
-        await sleep(160);
-        await goveeControl({ name: "brightness", value: 10 });
-        await sleep(220);
-        await goveeControl({ name: "brightness", value: 70 });
-        break;
+        case "GAIN_LIFE":
+          await goveeControlThrottled({ name: "turn", value: "on" });
+          await goveeControlThrottled({ name: "color", value: { r: 60, g: 255, b: 140 } });
+          await goveeControlThrottled({ name: "brightness", value: 25 });
+          await sleep(140);
+          await goveeControlThrottled({ name: "brightness", value: 90 });
+          break;
 
-      case "COMMANDER_CAST":
-        await goveeControl({ name: "color", value: { r: 245, g: 132, b: 38 } });
-        await goveeControl({ name: "brightness", value: 100 });
-        await sleep(120);
-        await goveeControl({ name: "brightness", value: 35 });
-        await sleep(180);
-        await goveeControl({ name: "brightness", value: 90 });
-        break;
+        case "BOARD_WIPE":
+          await goveeControlThrottled({ name: "turn", value: "on" });
+          await goveeControlThrottled({ name: "color", value: { r: 255, g: 255, b: 255 } });
+          await goveeControlThrottled({ name: "brightness", value: 100 });
+          await sleep(160);
+          await goveeControlThrottled({ name: "brightness", value: 10 });
+          await sleep(220);
+          await goveeControlThrottled({ name: "brightness", value: 70 });
+          break;
 
-      case "COUNTER_WAR":
-        await goveeControl({ name: "color", value: { r: 120, g: 170, b: 255 } });
-        await goveeControl({ name: "brightness", value: 100 });
-        await sleep(110);
-        await goveeControl({ name: "brightness", value: 30 });
-        await sleep(110);
-        await goveeControl({ name: "brightness", value: 100 });
-        await sleep(110);
-        await goveeControl({ name: "brightness", value: 30 });
-        await sleep(110);
-        await goveeControl({ name: "brightness", value: 100 });
-        break;
+        case "COMMANDER_CAST":
+          await goveeControlThrottled({ name: "turn", value: "on" });
+          await goveeControlThrottled({ name: "color", value: { r: 245, g: 132, b: 38 } });
+          await goveeControlThrottled({ name: "brightness", value: 100 });
+          await sleep(120);
+          await goveeControlThrottled({ name: "brightness", value: 35 });
+          await sleep(180);
+          await goveeControlThrottled({ name: "brightness", value: 90 });
+          break;
 
-      default:
-        break;
+        case "COUNTER_WAR":
+          await goveeControlThrottled({ name: "turn", value: "on" });
+          await goveeControlThrottled({ name: "color", value: { r: 120, g: 170, b: 255 } });
+          await goveeControlThrottled({ name: "brightness", value: 100 });
+          await sleep(110);
+          await goveeControlThrottled({ name: "brightness", value: 30 });
+          await sleep(110);
+          await goveeControlThrottled({ name: "brightness", value: 100 });
+          await sleep(110);
+          await goveeControlThrottled({ name: "brightness", value: 30 });
+          await sleep(110);
+          await goveeControlThrottled({ name: "brightness", value: 100 });
+          break;
+
+        default:
+          break;
+      }
+    } finally {
+      // brief pause then restore the room lighting baseline
+      await sleep(250);
+      await restoreBaseline();
+      await sleep(200);
+      effectLock.current = false;
     }
   }
 
@@ -203,7 +271,7 @@ async function goveeControl(cmd) {
           </label>
         </div>
 
-        <div className="row wrap">
+        <div className="row wrap" style={{ marginTop: 10 }}>
           <select
             className="select"
             value={deviceId ? `${deviceId}|${model}` : ""}
@@ -225,6 +293,20 @@ async function goveeControl(cmd) {
             Test Lights
           </button>
         </div>
+
+        <div className="row wrap" style={{ marginTop: 10 }}>
+          <button className="btn" onClick={() => saveBaseline(DEFAULT_BASELINE)}>
+            Set Room Baseline
+          </button>
+          <button className="btn" onClick={restoreBaseline} disabled={!baseline}>
+            Restore Baseline
+          </button>
+        </div>
+
+        <div className="hint" style={{ marginTop: 8 }}>
+          Tip: Set your room lighting how you want (in Govee app), then edit DEFAULT_BASELINE in App.jsx
+          to match it and click “Set Room Baseline.” Effects will always return to that.
+        </div>
       </section>
 
       <main className="grid">
@@ -232,9 +314,7 @@ async function goveeControl(cmd) {
           <section key={p.id} className="card">
             <div className="row">
               <div className="playerName">{p.name}</div>
-              <div className={`pill ${p.life <= 5 ? "danger" : ""}`}>
-                {p.life <= 5 ? "Low Life" : "Life"}
-              </div>
+              <div className={`pill ${p.life <= 5 ? "danger" : ""}`}>{p.life <= 5 ? "Low Life" : "Life"}</div>
             </div>
 
             <div className="lifeRow">
@@ -261,7 +341,7 @@ async function goveeControl(cmd) {
               </button>
             </div>
 
-            <div className="row wrap">
+            <div className="row wrap" style={{ marginTop: 10 }}>
               <button className="btn small" onClick={() => triggerEffect("DMG_BIG")}>
                 Big Hit
               </button>
