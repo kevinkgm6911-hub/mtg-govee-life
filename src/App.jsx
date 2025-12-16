@@ -66,27 +66,31 @@ export default function App() {
     );
   }
 
-  async function goveeControl(cmd) {
-    if (!goveeEnabled) return;
-    if (!deviceId || !model) return;
+async function goveeControl(cmd) {
+  if (!goveeEnabled) return;
+  if (!deviceId || !model) return;
 
-    const resp = await fetch("/.netlify/functions/govee-control", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        device: deviceId,
-        model,
-        cmd,
-      }),
-    });
+  const resp = await fetch("/.netlify/functions/govee-control", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ device: deviceId, model, cmd }),
+  });
 
-    // Helpful debug if something goes wrong
-    const data = await resp.json().catch(() => ({}));
-    if (!resp.ok) {
-      console.error("Govee control failed:", resp.status, data);
-    }
-    return data;
+  // Don't assume JSON; govee-control may return an empty body on success.
+  const text = await resp.text();
+  let data = null;
+  try {
+    data = text ? JSON.parse(text) : null;
+  } catch {
+    data = { raw: text };
   }
+
+  if (!resp.ok) {
+    console.error("Govee control failed:", resp.status, data);
+  }
+
+  return data;
+}
 
   function sleep(ms) {
     return new Promise((r) => setTimeout(r, ms));

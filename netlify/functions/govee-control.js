@@ -5,23 +5,9 @@ export const handler = async (event) => {
       return { statusCode: 500, body: JSON.stringify({ error: "Missing GOVEE_API_KEY" }) };
     }
 
-    if (!event.body) {
-      return { statusCode: 400, body: JSON.stringify({ error: "Missing request body" }) };
-    }
-
-    let parsed;
-    try {
-      parsed = JSON.parse(event.body);
-    } catch {
-      return { statusCode: 400, body: JSON.stringify({ error: "Body was not valid JSON" }) };
-    }
-
-    const { device, model, cmd } = parsed || {};
+    const { device, model, cmd } = JSON.parse(event.body || "{}");
     if (!device || !model || !cmd) {
-      return {
-        statusCode: 400,
-        body: JSON.stringify({ error: "Expected { device, model, cmd }", received: parsed }),
-      };
+      return { statusCode: 400, body: JSON.stringify({ error: "Expected { device, model, cmd }" }) };
     }
 
     const resp = await fetch("https://developer-api.govee.com/v1/devices/control", {
@@ -33,17 +19,25 @@ export const handler = async (event) => {
       body: JSON.stringify({ device, model, cmd }),
     });
 
+    // Govee sometimes returns an empty body; force a JSON response to the client.
     const text = await resp.text();
-    let data;
+    let data = null;
     try {
-      data = JSON.parse(text);
+      data = text ? JSON.parse(text) : null;
     } catch {
       data = { raw: text };
     }
 
-    // Return Govee’s status code + body, even on errors, instead of throwing.
-    return { statusCode: resp.status, body: JSON.stringify(data) };
+    return {
+      statusCode: resp.status,
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ok: resp.ok, status: resp.status, data }),
+    };
   } catch (err) {
-    return { statusCode: 500, body: JSON.stringify({ error: String(err), stack: err?.stack }) };
+    return {
+      statusCode: 500,
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ok: false, error: String(err) }),
+    };
   }
 };
