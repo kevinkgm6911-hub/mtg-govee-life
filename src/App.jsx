@@ -44,6 +44,7 @@ export default function App() {
         const resp = await fetch("/.netlify/functions/govee-devices");
         const json = await resp.json();
         const list = json?.data?.devices || [];
+        console.log("GOVEE DEVICES:", list);
         setDevices(list);
 
         // If user hasn’t chosen yet, auto-pick the first controllable one
